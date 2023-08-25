@@ -1,0 +1,50 @@
+Person1 added
+- name: Chris
+- URI: https://example.com/chrismd
+Person2 added
+- name: Alice
+- URI: https://example.com/alice123
+----------------------------------------------------------------
+Alice adds LikeActivity to Outbox
+- You liked https://chrismd.com/like post
+
+Chris reads a LikeActivity from Inbox
+- https://example.com/alice123 liked your post
+----------------------------------------------------------------
+Alice adds a FollowActivity to Outbox
+- URI: https://alice123.com/follow
+- actor: https://example.com/chrismd
+- object: https://example.com/alice123
+
+Chris reads a FollowActivity from Inbox
+- actor: https://example.com/alice123 started following you
+----------------------------------------------------------------
+Alice adds a UnfollowActivity to Outbox
+- URI: https://alice123.com/follow
+- actor: https://example.com/chrismd
+- object: https://example.com/alice123
+----------------------------------------------------------------
+Alice adds a CreateActivity to Outbox
+- URI: https://alice123.com/create
+- audience: GLOBAL
+- likes: 0
+- shares: 0
+- content: "Welcome to my account!"
+- name: "First Post!"
+- published: 2023-04-15T22:00
+- deleted: false
+
+Chris reads a CreateActivity
+- https://example.com/alice123 made the post:"First Post!"
+----------------------------------------------------------------
+Alice adds a DeleteActivity to Outbox
+- URI: https://alice123.com/create
+- audience: GLOBAL
+- likes: 0
+- shares: 0
+- content: "Welcome to my account!"
+- name: "First Post!"
+- published: 2023-04-15T22:00
+- deleted: true
+
+End of demo

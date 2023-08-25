@@ -1,0 +1,12 @@
+I think that my JavaDoc project has some really nice highlights to it.
+One of these highlights is how DeleteActivity works. Instead of making a class that makes a new DeleteActivity object alltogether,
+it takes in an already existing CreateActivity object and changes the deleted status to true instead of false. It keeps the code clean and doubles as a checker to see if
+the post exists at all.
+Another highlight I would say for a similar reason is the Audience enum. I used that as a selection of valid auidences for a post to have.
+
+A place where my code lacks is in StreamActivity. I did not make much use of this function. I wasn't too sure how to work around the need of many constructors and the issues that
+would arise from that. I instead opted to go for simply creating new instances of each activity instead of the parent activity which i assume may be the correct way of handling it.
+I would definetely would have changed this to make object of type StreamObject if I had more time.
+Another rthing I would have done if I have more time would be change followers and following to be lists instead of integers. I personally first saw these variales to be integers,
+just like in other social media that would display followers as a number. Having talked to others, they seem to be using lists. I can see how I could have implemented lists of people
+as the followers and show the number using a getCount() to show the nubmer of followers
