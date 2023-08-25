@@ -1,0 +1,994 @@
+#!/usr/bin/env zsh
+
+# Script to upload a file to Einstein.
+#
+# Usage... run like this to see the usage massage:
+#
+#    $ einstein -h
+#
+# You might have to provide your password (but you should only have to do that once).
+#
+# Installing this script locally
+# ==============================
+#
+# 1) Install zsh, on many Debian/Ubuntu-like systems, that's
+#
+#    $ sudo apt-get install zsh
+#
+#    On MacOS, install homebrew, and then install zsh:
+#    https://brew.sh/
+#
+# 2) Download the script:
+#
+#    $ wget "https://einstein.computing.dcu.ie/res/einstein"
+#
+# 3) This script needs to know your DCU username on Einstein.  On SoC servers, that's
+#    trivial, because it's just $( whoami ).  If you're running this elsewhere, though,
+#    your local username probably won't match your DCU username.
+#
+#    In, that case...
+#
+#      either:
+#      1) set the EINSTEIN_USERNAME variable in your ~/.bashrc,
+#         (SOC_USERNAME works too, so does DCU_USERNAME),
+#
+#         export EINSTEIN_USERNAME="bloggsj123"
+#
+#         ...and restart your shell:
+#
+#         $ exec bash
+#
+#      or:
+#      2) or just hard wire your DCU username below, like this:
+#         username=bloggsj
+#
+# 4) Install the file and make it executable; something like:
+#
+#    $ sudo install -v -m 0755 einstein /usr/local/bin
+#
+if [[ -n $EINSTEIN_USERNAME ]]
+then
+   username=$EINSTEIN_USERNAME
+elif [[ -n $DCU_USERNAME ]]
+then
+   username=$DCU_USERNAME
+elif [[ -n $SOC_USERNAME ]]
+then
+   username=$SOC_USERNAME
+else
+   username=$( whoami )
+   # If necessary, uncomment and edit the following line to hard wire you username:
+   # username=bloggsj123
+fi
+
+contains ()
+{
+   local thing=$argv[1]; shift
+   [[ ${argv[(ie)$thing]} -le $#argv ]]
+}
+
+if contains $username "socexam" "socguest" "exam"
+then
+  cat >&2 <<EOF
+You are uploading to Einstein using a shared account: "$username".
+This is not permitted because your work cannot be associated with
+your own account.
+EOF
+  exit 1
+fi
+
+# Requirements: zsh, curl and sha1sum.
+#
+# Lecturers only...: jq (only required for auto-installing marker output).
+#
+# "sha1sum" is apparently known as "shasum" on MacOS.
+#
+sha1sum="sha1sum"
+if ! command which $sha1sum
+then
+   command which shasum && sha1sum="shasum"
+fi > /dev/null
+
+zmodload -F zsh/stat b:zstat
+zmodload zsh/datetime
+
+# ########################################################################
+# Help.
+#
+if [[ $argv[1] == "-h" ]] || [[ $argv[1] == "--help" ]]
+then
+   pager ()
+   {
+      if [[ -t 1 ]]
+      then
+	 less
+      else
+	 cat
+      fi
+   }
+   #
+   cat <<EOF | pager
+Uploading to einstein:
+
+   $ $0:t FILE|DIRECTORY [FILES|DIRECTORIES...]
+     For files, upload the file to einstein.
+
+     For directories (and primarily for staff)... if the directory appears to be
+     a marker directory and the directory contains an exemplar, then upload the
+     exemplar.
+
+     For directories (otherwise)... upload the most recently-edited task file
+     in the current working directory.
+
+   $ $0:t
+     The same as "$0:t \$PWD".
+
+Other usage (likely useful for staff only):
+   $ $0:t -i
+     Upload exemplar, but run "make install" in the parent directory first.
+
+     This is useful for installing and testing markers (if you use "make install"
+     to install your markers).  Possibly of interest to SB only.
+
+   $ $0:t -a
+     Upload exemplar, then install the resulting standard output in the local
+     "stdout.txt" files.
+
+     This is useful for having einstein itself generate the expected standard
+     output (because running tests locally can be fiddly and error prone).
+
+   $ $0:t -p
+     Generate "publish.txt" file to publish a model solution.
+
+     Also... if this is a git repo, then "git add publish.txt"
+     Also... if a suitable makefile and target exist in the parent directory,
+     then run "make -C .. install".
+
+   $ $0:t -u
+     Remove "publish.txt" file to unpublish a model solution.
+
+     Also... if this is a git repo, then "git rm publish.txt".
+     Also... if a suitable makefile and target exist in the parent directory,
+     then run "make -C .. install".
+
+     This actually removes "**/publish.txt", so it can be used to unpublish *all*
+     model solutions at the start of the academic year.
+EOF
+   exit 0
+fi
+
+# ########################################################################
+# Arguments.
+#
+# These are primarily for SB's usage.  They are for installing and testing
+# Einstein markers.
+#
+
+publish=
+unpublish=
+install_markers=
+install_outputs=
+
+while getopts 'puia' opt
+do
+   case $opt in
+      p      ) publish="yes" ;;
+      u      ) unpublish="yes" ;;
+      i      ) install_markers="yes" ;;
+      a      ) install_outputs="yes" ;;
+      \?     ) print "invalid option: -$opt" >&2; exit 1 ;;
+   esac
+done
+shift $((OPTIND-1))
+
+# ########################################################################
+# Utilities.
+
+# The output is tweaked somewhat for the case where we're uploading multiple files
+# at the same time.
+#
+reduced_output=''
+unless_reduced_output ()
+{
+   [[ -z $reduced_output ]] && $argv
+}
+
+{
+   if [[ -t 1 ]]
+   then
+      RED='\033[0;31m'
+      GREEN='\033[0;32m'
+      BLUE='\033[0;34m'
+      NC='\033[0m'
+   else
+      RED=""
+      GREEN=""
+      BLUE=""
+      NC=""
+   fi
+
+   coloured ()
+   {
+      local colour=$argv[1]; shift
+      print -- "$colour$argv$NC"
+   }
+}
+
+print $SSH_CLIENT none | read ssh_client junk
+http ()
+{
+   curl --header "x-ssh-client: $ssh_client" --silent --config - $argv <<< "user = \"$username:$password\""
+}
+
+is-git-repo ()
+{
+   local directory=$argv[1]
+   (
+      cd $directory && git -C . rev-parse 2> /dev/null
+   )
+}
+
+relative-path ()
+{
+   realpath --relative-to=$PWD $argv[1]
+}
+
+have-makefile ()
+{
+   local directory=$argv[1]
+
+   [[ -f $directory/Makefile ]] || [[ -f $directory/makefile ]]
+}
+
+have-make-target ()
+{
+   local directory=$argv[1]
+   local target=$argv[2]
+
+   make -n -s -C $directory $target > /dev/null 2>&1
+}
+
+run-make-install ()
+{
+   local directory=$argv[1]:a
+
+   # Never install if $directory is already an Einstein marker directory.
+   #
+   if [[ $( hostname ) == "einstein" ]] && [[ $directory == ~/markers/* ]]
+   then
+      print "Skipping 'make install' in Einstein marker directory."
+      print
+      return 0
+   fi
+
+   # This is probably very SB specific but, ...
+   # If there is a make file with a target "install" in the parent directory,
+   # then run that target.
+   #
+   set -e
+   if have-makefile $directory && have-make-target $directory install
+   then
+      print "install via makefile in" $( relative-path $directory )
+      make -C $directory install
+   else
+      print "error: cannot find 'make install' target in '$directory'" >&2
+      false
+   fi
+   set +e
+}
+
+# ########################################################################
+# Check for required commands.
+#
+{
+   have ()
+   {
+      command which $argv > /dev/null
+   }
+
+   # This is not a comprehensive list; it's just the commands which are most likely to be missing.
+   #
+   required_commands=( curl $sha1sum)
+   [[ -n $publish ]] && required_commands+=( git )
+   [[ -n $unpublish ]] && required_commands+=( git )
+   [[ -n $install_markers ]] && required_commands+=( make )
+   [[ -n $install_outputs ]] && required_commands+=( jq )
+
+   for command in $required_commands
+   do
+      if ! have $command
+      then
+	 print "error: cannot find command '$command' (which is required), please install it" >&2
+	 exit 1
+      fi
+   done
+
+   unset command required_commands
+   unset -f have
+}
+
+# ########################################################################
+# Publish/unpublish model solutions.
+#
+publish-model-solutions ()
+{
+   set -e
+   local dir directory task
+   [[ $#argv == 0 ]] && set -- "."
+
+   for dir in $argv
+   do
+      [[ -f $dir ]] && dir=$dir:h
+
+      directory=$dir:a
+      task=$directory:t
+
+      if ! [[ -f $directory/$task ]]
+      then
+	 print "error: no exemplar to publish in" $( relative-path $directory/$task ) >&2
+	 exit 1
+      fi
+
+      print "touch" $( relative-path $dir/publish.txt )
+      touch $directory/publish.txt
+      is-git-repo $directory && ( cd $directory && git add --verbose publish.txt )
+
+      have-makefile $directory:h \
+	 && have-make-target $directory:h install \
+	 && run-make-install $directory:h \
+	 || true
+   done
+   exit 0
+}
+
+unpublish-model-solutions ()
+{
+   set -e
+   local dir directory task
+   [[ $#argv == 0 ]] && set -- **/publish.txt(.N)
+
+   for dir in $argv
+   do
+      [[ -f $dir ]] && dir=$dir:h
+      directory=$dir:a
+
+      [[ -f $directory/publish.txt ]] || continue
+
+      if is-git-repo $directory
+      then
+	 ( cd $directory && git rm -f publish.txt )
+      else
+	 rm -v $directory/publish.txt
+      fi
+
+      have-makefile $directory:h \
+	 && have-make-target $directory:h install \
+	 && run-make-install $directory:h \
+	 || true
+   done
+   exit 0
+}
+
+[[ -n $publish ]] && publish-model-solutions $argv
+[[ -n $unpublish ]] && unpublish-model-solutions $argv
+
+# ########################################################################
+# Install via make, if requested.
+#
+if [[ -n $install_markers ]]
+then
+   run-make-install ".."
+fi
+
+# ########################################################################
+# Ensure we have a working username and password.
+#
+# The secret salt here isn't to make the encryption secure; it's rather just to
+# reduce the likelihood that somebody stumbles across an unencrytpted password
+# in one of the off-site backups.
+
+pw_file=$HOME/.einstein-passwd-v2.txt
+secret="Eey6ahchDoho5yu5"
+
+have_openssl_pbkdf2 ()
+{
+   date | openssl enc -pbkdf2 -aes256 -base64 -pass pass:$secret > /dev/null 2>&1
+}
+
+if have_openssl_pbkdf2
+then
+   enc=( openssl enc -pbkdf2 -aes256 -base64 -pass pass:$secret -out $pw_file )
+   dec=( openssl enc -d -pbkdf2 -aes256 -base64 -pass pass:$secret -in $pw_file )
+else
+   enc=( openssl enc -aes256 -base64 -pass pass:$secret -out $pw_file )
+   dec=( openssl enc -d -aes256 -base64 -pass pass:$secret -in $pw_file )
+fi
+
+{
+   # Migration v1 -> v2.
+   # Version 1 was using a depricated form of encryption.
+   #
+   pw_file_v1=$HOME/.einstein-passwd.txt
+
+   if [[ -s $pw_file_v1 ]] && ! [[ -f $pw_file ]]
+   then
+      if openssl enc -d -aes256 -base64 -pass pass:$secret -in $pw_file_v1 2> /dev/null | $enc
+      then
+	 chmod 0600 $pw_file
+	 rm $pw_file_v1
+      fi
+   fi
+
+   unset pw_file_v1
+}
+
+if [[ -f $pw_file ]] && ! $dec -out /dev/null
+then
+   rm -v $pw_file
+fi
+
+if ! [[ -f $pw_file ]]
+then
+   print "this-is-not-the-correct-password" | $enc
+   chmod 0600 $pw_file
+fi
+
+password=$( $dec )
+
+ask_user_for_password ()
+{
+   print "user:" $(coloured $BLUE $username)
+   read -s password"?enter your password: "
+   print
+   print $password | $enc
+   chmod 0600 $pw_file
+}
+
+while ! http --output /dev/null --write-out "%{http_code}\n" "https://ca007.computing.dcu.ie/einstein/now" | grep -q -w 200
+do
+   ask_user_for_password
+done
+
+# ########################################################################
+# Fetch the Einstein task list (and, hence, the module list too).
+#
+# These are lines of the form:
+#
+#    75d16fa158ba3c795051fa3b6a4a3a10b580c595 ca114 ca116 ca117
+#
+# where the hash is the SHA1 hash of the task name, and the rest of the tokens are the modules on which that
+# task is available.
+#
+# For the vast majority of tasks, the task name is unique to the module.
+#
+# For a number of tasks (e.g. "hello.py"), the same task name is available on several modules.
+#
+
+fetch_tasks ()
+{
+   # This really shouldn't fail but, if it does, then we want to know about it.
+   #
+   set -e
+   print -- $argv
+   print
+   #
+   [[ -f ~/.einstein-tasks.txt.tmp   ]] && chmod u+w ~/.einstein-tasks.txt.tmp
+   [[ -f ~/.einstein-tasks.txt       ]] && chmod u+w ~/.einstein-tasks.txt
+   [[ -f ~/.einstein-modules.txt.tmp ]] && chmod u+w ~/.einstein-modules.txt.tmp
+   [[ -f ~/.einstein-modules.txt     ]] && chmod u+w ~/.einstein-modules.txt
+   #
+   # If we're running on the Einstein server, then just copy the file.  Otherwise, fetch
+   # it over the network.
+   #
+   if [[ -f "/var/www/termcast/tasks.txt" ]]
+   then
+      cp "/var/www/termcast/tasks.txt" ~/.einstein-tasks.txt.tmp
+   else
+      http "https://einstein.computing.dcu.ie/termcast/tasks.txt" > ~/.einstein-tasks.txt.tmp
+   fi
+   #
+   cut -d ' ' -f 2- ~/.einstein-tasks.txt.tmp | tr " " "\n" | sort | uniq > ~/.einstein-modules.txt.tmp
+   mv ~/.einstein-modules.txt.tmp ~/.einstein-modules.txt
+   mv ~/.einstein-tasks.txt.tmp ~/.einstein-tasks.txt
+   set +e
+}
+
+if ! [[ -s ~/.einstein-tasks.txt ]]
+then
+   fetch_tasks "fetch the task list..."
+fi
+
+last_task_list_update_time=$( zstat +mtime ~/.einstein-tasks.txt )
+if (( 60 * 15 < $EPOCHSECONDS - last_task_list_update_time ))
+then
+   fetch_tasks "refresh the task list..."
+fi
+
+# ########################################################################
+# Fetch registrations.  This is used to filter the modules for which this user
+# may be uploading.
+#
+# Commonly, the same task name is used on multiple (many!) different modules.  Here,
+# we try to filter the modules to just the ones on which the student is actually registered.
+#
+# If there are no matches (e.g. for staff or guests), then we just keep the entire list.
+#
+
+registrations="$HOME/.einstein-registrations.txt"
+
+fetch_registrations () {
+  set -e
+  print -- $argv
+  print
+  http "https://einstein.computing.dcu.ie/termcast/registrations.txt" > $registrations.tmp
+  mv $registrations.tmp $registrations
+  set +e
+}
+
+if ! [[ -f $registrations ]]
+then
+  fetch_registrations "fetch the registration list..."
+fi
+
+last_registrations_update_time=$( zstat +mtime $registrations )
+if (( 60 * 60 * 12 < EPOCHSECONDS - last_registrations_update_time ))
+then
+   fetch_registrations "refresh the registration list..."
+fi
+
+hash_registration () {
+  local module=$argv[1]
+  local sha1 junk user=$argv[2]
+
+  print -- "$module-$user" | $sha1sum | read sha1 junk
+  print -- $sha1
+}
+
+user_is_registered_on_module () {
+  local module=$argv[1]
+
+  grep -q -F $( hash_registration $module $username ) $registrations
+}
+
+filter_modules_by_registration () {
+  local -a matched
+  local module
+
+  for module
+  do
+    user_is_registered_on_module $module && matched+=( $module )
+  done
+
+  [[ $#matched != 0 ]] && print -- $matched
+  [[ $#matched == 0 ]] && print -- $argv
+}
+
+# ########################################################################
+# Work out the module at hand (for a particular task file).
+
+# Test whether a string is a known Einstein module name.
+#
+is_module ()
+{
+   fgrep -w $argv[1] < ~/.einstein-modules.txt
+}
+
+# If the path is something like /home/blott/CA116/week-01/hello.py, then the module is "ca116".
+#
+get_module_by_path ()
+{
+   local file=$argv[1]
+   local realpath=$file:a:l
+
+   # Below, "z" means split on IFS/whitespace, "s:/:" means split on directory separators.
+   # It would be better to split on "-", "_" and the like too, but I don't know how to do that
+   # concisely.
+   #
+   for component in ${(zs:/:)realpath:h}
+   do
+      is_module $component:l && return
+   done
+
+   false
+}
+
+# Like above, but also accept junk like ~/myCA116directory.
+#
+get_module_by_sloppy_path ()
+{
+   local mod file=$argv[1]:a:l
+   for mod in $( < ~/.einstein-modules.txt )
+   do
+      if [[ $file == *$mod* ]]
+      then
+	 print $mod
+	 return
+      fi
+   done
+   false
+}
+
+# Get a list of modules for which the task has a marker for the upload file name.
+# (The intended module can only one of these, because other modules do not have markers!)
+#
+get_module_by_task ()
+{
+   local sha1 junk file=$argv[1] task=$file:t
+   local -a mods
+
+   # This allows us to use ./einstein-sh to upload dot files.  The server strips any leading dot
+   # on uploaded filenames in the same way.
+   #
+   if [[ $task[1] == "." ]]
+   then
+     task=$task[2,$#task]
+   fi
+
+   print -n $task | $sha1sum | read sha1 junk
+   mods=( $( fgrep $sha1 ~/.einstein-tasks.txt ) )
+
+   if [[ $#mods == 0 ]] || [[ $#mods == 1 ]]
+   then
+      false
+   else
+      # Shift off the hash (leaving just the modules).
+      shift mods
+      print -l -- $mods
+   fi
+}
+
+# This outputs a list of candidate modules for the upload file (and succeeds only if at
+# least one module is found).
+#
+get_modules ()
+{
+   get_module_by_path $argv || get_module_by_sloppy_path $argv || get_module_by_task $argv
+}
+
+# ########################################################################
+# Remember a previous module choice.
+#
+get_previous_module ()
+{
+   [[ -s ~/.einstein-previous-module.txt ]] && print -- $( < ~/.einstein-previous-module.txt )
+}
+
+remember_previous_module ()
+{
+   [[ $#argv == 1 ]] && print -- $argv[1] > ~/.einstein-previous-module.txt
+}
+
+# ########################################################################
+# Handle the actual uploads.
+#
+handle_upload ()
+{
+   local module
+   local -a mods selections
+   mods=( $( get_modules $argv ) )
+   mods=( $( filter_modules_by_registration $mods ) )
+
+   case $#mods in
+      0 )
+	 print -- "error:" $argv[1]:t "is not a valid task name in any Einstein module" >&2
+	 false; return $? ;;
+
+      1 )
+	 # There's only one module, so we're done.
+	 true ;;
+
+      * )
+         # See if there is a termcast site we can use.
+         #
+         termcast_site="$HOME/.termcast-site.txt"
+	 if [[ $#mods != 1 ]] && [[ -s $termcast_site ]] && site=$( < $termcast_site ) && contains $site $mods
+         then
+           print "using TermCast module:" $( coloured $BLUE $site )
+           print
+           mods=( $site )
+         fi
+
+	 # There is still more than one candidate module.  We'll have to ask the user.
+	 #
+	 # First, ask if they want to re-use a previous choice (if there is one).
+	 #
+	 if [[ $#mods != 1 ]] && module=$( get_previous_module ) && contains $module $mods
+	 then
+	    print
+	    print "You previously uploaded for module" $( coloured $BLUE $module )"."
+	    print "Type 'y' to choose" $( coloured $BLUE $module ) "again (or anything else to pick a different module)."
+
+	    if read -q answer"?? "
+	    then
+	       mods=( $module )
+	       print
+	    fi
+	 fi
+	 #
+	 # If there are still multiple choices, then pick from a list.
+	 #
+	 selections=( $mods )
+	 while [[ $#mods != 1 ]]
+	 do
+	    PS3="Enter one of the number choices above, or the module code... "
+	    print -l -- "" "'${BLUE}$argv[1]:t$NC' is a task on the following modules, pick a module...\n"
+	    #
+	    select module in $selections
+	    do
+	       if [[ -z $module ]] && [[ -n $REPLY ]] && contains $REPLY $selections
+	       then
+		  mods=( $REPLY )
+	       elif [[ -n $module ]]
+	       then
+		  mods=( $module )
+	       else
+		  print
+		  print $( coloured $RED "Computer says 'no'; enter either the module code or the corresponding number..." )
+	       fi
+	       break
+	    done
+	 done
+	 #
+	 remember_previous_module $mods[1] ;;
+   esac
+
+   module=$mods[1]
+   upload_file $module $argv
+}
+
+upload_file ()
+{
+   local module=$argv[1]
+   local file=$argv[2]
+   local task=$file:t
+   local web_page="https://$module.computing.dcu.ie/"
+
+   print "file:" $( coloured $BLUE $( realpath --relative-to=$PWD $file) )
+   print "task:" $( coloured $BLUE $module/$task )
+   print "web :" $( coloured $BLUE $web_page )
+   #
+   if [[ $file:a == */markers/* ]]
+   then
+      # This is an Einstein marker directory.
+      #
+      reduced_output="yes"
+      #
+      if [[ -f "$file:a:h/task-description.html" ]]
+      then
+	 bytes=$( wc -c < "$file:a:h/task-description.html" )
+	 sha=$( $sha1sum "$file:a:h/task-description.html" | cut -d ' ' -f 1 )
+	 print "note:" $( coloured $BLUE "task-description.html detected" )
+	 print "     " $( coloured $BLUE "task-description.html: $bytes byte(s), $sha" )
+      else
+	 print "note:" $( coloured $BLUE "task-description.html not detected" )
+      fi
+   fi
+   #
+   print
+   print "Uploading" $( coloured $BLUE $task ) "to Einstein (this may take a few seconds)..."
+
+   mkdir -p ~/.einstein
+   http --form "file=@$file" "${web_page}einstein/upload" | tee ~/.einstein/$module-$task.json | format_report $file $module $task
+}
+
+format_report ()
+{
+   local -i passed=0 failed=0 tests=0
+   local report module einstein task test_name result
+
+   local call_file=$argv[1]
+   local call_module=$argv[2]
+   local call_task=$argv[3]
+
+   print
+   while read report module einstein task test_name result
+   do
+      [[ $report == "#test-report" ]] || continue
+
+      tests+=1
+      [[ $result == "passed" ]] && print $( coloured $GREEN "*** test $tests: $result" ) && passed+=1
+      [[ $result == "failed" ]] && print $( coloured $RED   "*** test $tests: $result" ) && failed+=1
+   done
+
+   if (( tests == 0 ))
+   then
+      print $( coloured $RED "*** error: invalid task name" )
+      print $( coloured $RED "*** error: ... $call_task is not a task on $call_module" )
+      print
+      return 1
+   fi
+
+   unless_reduced_output print
+   if (( passed < tests ))
+   then
+      print $( coloured $RED "*** failed: $failed of $tests" )
+   fi
+
+   if (( 0 < passed ))
+   then
+      print $( coloured $GREEN "*** passed: $passed of $tests" )
+   fi
+
+   if (( passed == tests ))
+   then
+      print $( coloured $GREEN "*** overall: correct" )
+   else
+      print $( coloured $RED "*** overall: incorrect" )
+   fi
+
+   unless_reduced_output print
+   print $( coloured $BLUE "*** report: https://$call_module.computing.dcu.ie/einstein/report.html" )
+
+   # Use with caution!
+   # Only lecturers are ever likely to want to do this.
+   #
+   # This is used to install the *actual* outputs from the Einstein uploads
+   # as the expected outputs for the task.
+   #
+   if [[ -n $install_outputs ]]
+   then
+      install_actual_outputs $call_file $call_module $call_task
+   fi
+
+   (( passed == tests ))
+}
+
+# ########################################################################
+# Primarily for SB, to support writing Einstein markers.
+#
+# Assume that the outputs are correct, and install them in the relevant stdout.txt files.
+#
+# Requires jq:
+#   apt-get install jq
+#   brew install rq      (perhaps, I'm just guessing).
+#
+
+install_marker_output ()
+{
+  local test dst json=$argv[1]
+
+  for test in $( jq -r ".results[] | .test" $json )
+  do
+    case $test in
+      test0  ) dst="./"    ;;   # Rename for main test (it's in the root/current directory).
+      */../* ) continue    ;;   # Skip module wide tests.
+      *      ) dst="$test" ;;   # Everything else should already have the correct directory name.
+    esac
+
+    print $test $dst
+    jq -r -j ".results[] | select(.test==\"$test\") | .stdout" $json > ${dst}stdout.txt \
+      || return $?
+    print "  ...installed:" $( wc "${dst}stdout.txt" )
+  done
+}
+
+install_actual_outputs ()
+{
+   local file=$argv[1]
+   local module=$argv[2]
+   local task=$argv[3]
+
+   local json=$HOME/.einstein/$module-$task.json
+
+   # The JSON is embedded in a rather strange way in the response from the
+   # HTTP POST, above.
+   #
+   # Tidy it up, so that we're left just with the JSON.
+   #
+   sed -i '/^#test/ d; s/^#json //;' $json
+   print -l "" "writing expected stdout.txt for $task..."
+
+   (
+      cd $file:a:h
+      install_marker_output $json
+   ) || exit 1
+}
+
+# ########################################################################
+# Work out the most recently-updated task file in a directory.
+#
+
+get_recent_file () {
+   local file sha1 junk answer directory=$argv[1]
+
+   for file in $directory/*(.Nom)
+   do
+      print -n $file:t | $sha1sum | read sha1 junk
+
+      if fgrep -q $sha1 ~/.einstein-tasks.txt
+      then
+	 {
+	    print
+	    print "Picking your most recently-edited task file:" $( coloured $BLUE $( realpath --relative-to=$PWD $file ) )
+	 } >&2
+	 print $file
+	 return
+      fi
+   done
+
+   print $directory
+}
+
+# ########################################################################
+# Tweak the command-line arguments:
+#
+#    - empty -> "."
+#    - /foobar/hello.py/ -> /foorbar/hello.py/hello.py
+#    - /ca116/ -> most recently-edited task file
+#    - and expand MVTs
+#
+# Yikes!
+# A recursive shell script!
+#
+# This will loop for ever if it encounters a malformed MVT task (an MVT task
+# which links to itself).
+
+[[ $#argv == 0 ]] && set -- "."
+
+resolve_argument ()
+{
+   local file=$argv[1]
+   local candidate_task_name=$file:a:t
+
+   if [[ -d $file ]] && [[ -f "$file/multi-variant-task.txt" ]]
+   then
+      file="$file/multi-variant-task.txt"
+      reduced_output="yes"
+
+   elif [[ -d $file ]] && [[ -f $file/$candidate_task_name ]]
+   then
+      file="$file/$candidate_task_name"
+      reduced_output="yes"
+
+   elif [[ -d $file ]]
+   then
+      # Offer the most-recently-updated task file.
+      #
+      file=$( get_recent_file $file )
+   fi
+
+   if [[ -f $file ]] && [[ $file:t == "multi-variant-task.txt" ]]
+   then
+      variants=( $( < $file ) )
+      print "MVT detected; selecting $#variants variant(s):" >&2
+      #
+      for variant in $variants
+      do
+	 print "   $file:h/../$variant" >&2
+	 resolve_argument "$file:h/../$variant"
+      done
+   else
+      print $file
+   fi
+}
+
+args=()
+for arg in $argv
+do
+   args+=( $( resolve_argument $arg ) )
+done
+
+set -- $args
+
+(( 1 < $#argv )) && reduced_output="yes"
+[[ $PWD == */markers/* ]] && reduced_output="yes"
+
+# ########################################################################
+# Run all of that...
+
+integer errors=0
+
+for file in $argv
+do
+   if [[ -f $file ]]
+   then
+      [[ $#argv == 1 ]] || print -l -- "" "**************************************************************"
+      handle_upload $file || errors+=1
+   else
+      print "error, invalid file: $file" >&2
+      errors+=1
+   fi
+done
+
+# Dummy commit 4: 12/12/2021 @ 10:48
+(( errors == 0 ))
